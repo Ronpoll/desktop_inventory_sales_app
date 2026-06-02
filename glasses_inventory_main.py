@@ -3393,27 +3393,96 @@ class App(tk.Tk):
 
     # ----- Inventory -----
 
+    # ------------------------------------------------------------------
+    # Inventory per-brand selections: {brand -> {"model": str, "sku": str}}
+    # Values are actual model/sku strings, or "" meaning "All".
+    # ------------------------------------------------------------------
+    def _inv_sel(self):
+        """Return the _inv_selections dict, creating it if needed."""
+        if not hasattr(self, "_inv_selections"):
+            self._inv_selections = {}
+        return self._inv_selections
+
+    def _inv_brand_iid(self, brand):
+        return f"brand::{brand}"
+
+    def _inv_item_id_for_brand(self, brand, show_msg=True):
+        """
+        Return the single item_id that matches the current brand+model+sku
+        selection, or None.  Used by Edit / Adjust / Delete.
+        """
+        sel = self._inv_sel().get(brand, {})
+        model_sel = sel.get("model", "")
+        sku_sel   = sel.get("sku",   "")
+        if not model_sel or not sku_sel:
+            if show_msg:
+                messagebox.showinfo(
+                    "Select item",
+                    "Please select both a Model and a SKU from the dropdowns first."
+                )
+            return None
+        with connect() as c:
+            # Use actual model value (placeholder-aware)
+            row = c.execute(
+                "SELECT id FROM items WHERE brand=? AND model=? AND sku=?",
+                (brand, model_sel, sku_sel)
+            ).fetchone()
+        if not row:
+            if show_msg:
+                messagebox.showinfo("Not found", "Could not find that exact item.")
+            return None
+        return int(row[0])
+
+    def _selected_inventory_item_id(self, show_msg=True):
+        """
+        Return item_id for the currently selected brand row + its
+        chosen model/sku dropdowns, or None.
+        """
+        sel = self.inv_tree.selection()
+        if not sel:
+            if show_msg:
+                messagebox.showinfo("Select", "Select a brand row first.")
+            return None
+        iid = sel[0]
+        if not iid.startswith("brand::"):
+            if show_msg:
+                messagebox.showinfo("Select", "Select a brand row.")
+            return None
+        brand = iid[len("brand::"):]
+        return self._inv_item_id_for_brand(brand, show_msg=show_msg)
+
     def build_inventory(self):
         top = ttk.Frame(self.inv_tab, padding=6)
         top.pack(fill="x")
 
-        ttk.Button(top, text="Add Inventory / הוסף למלאי", command=self.add_inventory).pack(side="left", padx=6)
+        ttk.Button(top, text="Add Inventory / הוסף למלאי",    command=self.add_inventory).pack(side="left", padx=6)
         ttk.Button(top, text="Adjust Qty (+/-) / עדכון כמות", command=self.adjust_selected_qty).pack(side="left", padx=6)
-        ttk.Button(top, text="Edit Item / ערוך פריט", command=self.edit_selected_item).pack(side="left", padx=6)
-        ttk.Button(top, text="Delete Item / מחק פריט", command=self.delete_selected_item).pack(side="left", padx=6)
+        ttk.Button(top, text="Edit Item / ערוך פריט",         command=self.edit_selected_item).pack(side="left", padx=6)
+        ttk.Button(top, text="Delete Item / מחק פריט",        command=self.delete_selected_item).pack(side="left", padx=6)
         ttk.Button(top, text="Search / חיפוש", command=lambda: SearchDialog(self)).pack(side="left", padx=18)
-        ttk.Button(top, text="Reset sort / איפוס מיון", command=lambda: treeview_reset_to_default(self.inv_tree)).pack(side="left", padx=8)
+        ttk.Button(top, text="Reset sort / איפוס מיון",
+                   command=lambda: treeview_reset_to_default(self.inv_tree)).pack(side="left", padx=8)
 
         self.inv_summary = ttk.Label(top, text="", padding=(10,2))
         self.inv_summary.pack(side="left", padx=16)
 
-        # Store item_id as iid for easy operations
-        self.inv_tree = ttk.Treeview(self.inv_tab, columns=("brand","model","sku","onhand"), show="headings", height=22)
-        headers = [("brand","Brand (מותג)"),("model","Model (דגם)"),("sku","SKU (מק״ט)"),("onhand","On Hand (במלאי)")]
-        widths = {"brand":280,"model":260,"sku":180,"onhand":140}
-        for c,t in headers:
-            self.inv_tree.heading(c, text=t, command=lambda cc=c: treeview_sort_column(self.inv_tree, cc, False))
-            self.inv_tree.column(c, width=widths.get(c,200))
+        # Treeview — one row per brand; model/sku columns show dropdown widgets
+        self.inv_tree = ttk.Treeview(
+            self.inv_tab,
+            columns=("brand","model","sku","onhand"),
+            show="headings", height=22
+        )
+        headers = [
+            ("brand",  "Brand (מותג)"),
+            ("model",  "Model (דגם) ▾"),
+            ("sku",    "SKU (מק״ט) ▾"),
+            ("onhand", "On Hand (במלאי)"),
+        ]
+        widths = {"brand": 240, "model": 200, "sku": 160, "onhand": 130}
+        for c, t in headers:
+            self.inv_tree.heading(c, text=t,
+                command=lambda cc=c: treeview_sort_column(self.inv_tree, cc, False))
+            self.inv_tree.column(c, width=widths.get(c, 180))
         self.inv_tree.column("onhand", anchor="center")
 
         vsb = ttk.Scrollbar(self.inv_tab, orient="vertical", command=self.inv_tree.yview)
@@ -3421,16 +3490,177 @@ class App(tk.Tk):
         self.inv_tree.pack(side="left", fill="both", expand=True, padx=(6,0), pady=6)
         vsb.pack(side="right", fill="y", padx=(0,6), pady=6)
 
-        self.refresh_inventory()
+        # Two overlay Comboboxes — repositioned over the selected row's cells
+        self._inv_model_cb = ttk.Combobox(self.inv_tree, state="readonly", width=18)
+        self._inv_sku_cb   = ttk.Combobox(self.inv_tree, state="readonly", width=14)
+        self._inv_cb_brand = None   # which brand the comboboxes are currently for
 
-    def _selected_inventory_item_id(self):
-        sel = self.inv_tree.selection()
-        if not sel:
-            return None
-        try:
-            return int(sel[0])
-        except Exception:
-            return None
+        def _place_combos(brand):
+            """Position the two comboboxes over the model/sku cells of the brand row."""
+            iid = self._inv_brand_iid(brand)
+            if not self.inv_tree.exists(iid):
+                return
+            bbox_model = self.inv_tree.bbox(iid, "model")
+            bbox_sku   = self.inv_tree.bbox(iid, "sku")
+            if not bbox_model or not bbox_sku:
+                # Row scrolled out of view — hide
+                self._inv_model_cb.place_forget()
+                self._inv_sku_cb.place_forget()
+                return
+            x1, y1, w1, h1 = bbox_model
+            x2, y2, w2, h2 = bbox_sku
+            self._inv_model_cb.place(x=x1, y=y1, width=w1, height=h1)
+            self._inv_sku_cb.place(x=x2, y=y2, width=w2, height=h2)
+
+        def _update_combos_for_brand(brand, preserve=True):
+            """Reload combobox values for brand; optionally keep existing selection."""
+            sel = self._inv_sel().setdefault(brand, {"model": "", "sku": ""})
+
+            models = [m for m in list_models_for_brand(brand) if not is_placeholder_model(m)]
+            # Add placeholder models as one combined "— (no model)" entry if any exist
+            has_placeholder = any(
+                is_placeholder_model(m)
+                for m in list_models_for_brand(brand)
+            )
+            model_values = (["— (no model)"] if has_placeholder else []) + models
+            model_cb_values = ["All"] + model_values
+            self._inv_model_cb["values"] = model_cb_values
+
+            # Restore or default model selection
+            cur_model = sel.get("model", "") if preserve else ""
+            if cur_model == "" :
+                self._inv_model_cb.set("All")
+            elif is_placeholder_model(cur_model):
+                self._inv_model_cb.set("— (no model)")
+            elif cur_model in model_cb_values:
+                self._inv_model_cb.set(cur_model)
+            else:
+                self._inv_model_cb.set("All")
+                sel["model"] = ""
+
+            # Refresh SKU values based on current model
+            _refresh_sku_cb(brand, preserve=preserve)
+
+        def _refresh_sku_cb(brand, preserve=True):
+            """Reload SKU combobox based on current model selection."""
+            sel = self._inv_sel().setdefault(brand, {"model": "", "sku": ""})
+            model_val = sel.get("model", "")
+            skus = list_skus_for_brand_model(brand, model_val)
+            sku_cb_values = ["All"] + skus
+            self._inv_sku_cb["values"] = sku_cb_values
+
+            cur_sku = sel.get("sku", "") if preserve else ""
+            if cur_sku == "" or cur_sku not in sku_cb_values:
+                self._inv_sku_cb.set("All")
+                sel["sku"] = ""
+            else:
+                self._inv_sku_cb.set(cur_sku)
+
+        def _on_model_selected(event):
+            brand = self._inv_cb_brand
+            if not brand:
+                return
+            sel = self._inv_sel().setdefault(brand, {"model": "", "sku": ""})
+            chosen = self._inv_model_cb.get()
+            if chosen == "All":
+                sel["model"] = ""
+            elif chosen == "— (no model)":
+                # Find the actual placeholder model string in DB
+                all_models = list_models_for_brand(brand)
+                ph = next((m for m in all_models if is_placeholder_model(m)), ".")
+                sel["model"] = ph
+            else:
+                sel["model"] = chosen
+            sel["sku"] = ""  # reset sku when model changes
+            _refresh_sku_cb(brand, preserve=False)
+            _refresh_inv_row(brand)
+
+        def _on_sku_selected(event):
+            brand = self._inv_cb_brand
+            if not brand:
+                return
+            sel = self._inv_sel().setdefault(brand, {"model": "", "sku": ""})
+            chosen = self._inv_sku_cb.get()
+            sel["sku"] = "" if chosen == "All" else chosen
+            _refresh_inv_row(brand)
+
+        def _refresh_inv_row(brand):
+            """Recompute on-hand for a brand row given current selections."""
+            iid = self._inv_brand_iid(brand)
+            if not self.inv_tree.exists(iid):
+                return
+            sel = self._inv_sel().get(brand, {})
+            model_sel = sel.get("model", "")
+            sku_sel   = sel.get("sku",   "")
+            with connect() as c:
+                if model_sel and sku_sel:
+                    row = c.execute(
+                        "SELECT id FROM items WHERE brand=? AND model=? AND sku=?",
+                        (brand, model_sel, sku_sel)
+                    ).fetchone()
+                    onhand = inventory_on_hand(c, int(row[0])) if row else 0
+                elif model_sel:
+                    rows = c.execute(
+                        "SELECT id FROM items WHERE brand=? AND model=?",
+                        (brand, model_sel)
+                    ).fetchall()
+                    onhand = sum(inventory_on_hand(c, int(r[0])) for r in rows)
+                elif sku_sel:
+                    rows = c.execute(
+                        "SELECT id FROM items WHERE brand=? AND sku=?",
+                        (brand, sku_sel)
+                    ).fetchall()
+                    onhand = sum(inventory_on_hand(c, int(r[0])) for r in rows)
+                else:
+                    rows = c.execute(
+                        "SELECT id FROM items WHERE brand=?", (brand,)
+                    ).fetchall()
+                    onhand = sum(inventory_on_hand(c, int(r[0])) for r in rows)
+            model_disp = self._inv_model_cb.get() if self._inv_cb_brand == brand else (
+                sel.get("model") or "All"
+            )
+            sku_disp = self._inv_sku_cb.get() if self._inv_cb_brand == brand else (
+                sel.get("sku") or "All"
+            )
+            self.inv_tree.set(iid, "onhand", onhand)
+
+        def _on_tree_select(event):
+            sel = self.inv_tree.selection()
+            if not sel:
+                self._inv_model_cb.place_forget()
+                self._inv_sku_cb.place_forget()
+                self._inv_cb_brand = None
+                return
+            iid = sel[0]
+            if not iid.startswith("brand::"):
+                self._inv_model_cb.place_forget()
+                self._inv_sku_cb.place_forget()
+                self._inv_cb_brand = None
+                return
+            brand = iid[len("brand::"):]
+            self._inv_cb_brand = brand
+            _update_combos_for_brand(brand, preserve=True)
+            _place_combos(brand)
+
+        def _on_tree_scroll(*args):
+            # Reposition combos after scroll
+            if self._inv_cb_brand:
+                self.inv_tree.after_idle(lambda: _place_combos(self._inv_cb_brand))
+
+        self._inv_model_cb.bind("<<ComboboxSelected>>", _on_model_selected)
+        self._inv_sku_cb.bind("<<ComboboxSelected>>",   _on_sku_selected)
+        self.inv_tree.bind("<<TreeviewSelect>>", _on_tree_select)
+        vsb.configure(command=lambda *a: (self.inv_tree.yview(*a), _on_tree_scroll()))
+        self.inv_tree.bind("<MouseWheel>",   lambda e: self.inv_tree.after_idle(lambda: _on_tree_scroll()))
+        self.inv_tree.bind("<Button-4>",     lambda e: self.inv_tree.after_idle(lambda: _on_tree_scroll()))
+        self.inv_tree.bind("<Button-5>",     lambda e: self.inv_tree.after_idle(lambda: _on_tree_scroll()))
+
+        # Store closures for use in refresh_inventory
+        self._inv_place_combos          = _place_combos
+        self._inv_update_combos         = _update_combos_for_brand
+        self._inv_refresh_row           = _refresh_inv_row
+
+        self.refresh_inventory()
 
     def add_inventory(self):
         win = tk.Toplevel(self)
@@ -3610,10 +3840,21 @@ class App(tk.Tk):
         self.refresh_all_months()
 
     def refresh_inventory(self):
+        # Hide combos while rebuilding
+        if hasattr(self, "_inv_model_cb"):
+            self._inv_model_cb.place_forget()
+            self._inv_sku_cb.place_forget()
+        prev_brand = getattr(self, "_inv_cb_brand", None)
+
         self.inv_tree.delete(*self.inv_tree.get_children())
         total_cost, total_units = 0.0, 0
+
+        # Collect all brands and their total on-hand
+        brand_onhand = {}   # brand -> total onhand (all items)
         with connect() as c:
-            rows = c.execute("SELECT id,brand,sku,model FROM items ORDER BY brand, model, sku").fetchall()
+            rows = c.execute(
+                "SELECT id, brand, sku, model FROM items ORDER BY brand, model, sku"
+            ).fetchall()
             for item_id, brand, sku, model in rows:
                 onhand = inventory_on_hand(c, int(item_id))
                 total_units += onhand
@@ -3622,9 +3863,48 @@ class App(tk.Tk):
                     total_cost += onhand * (sku_num / 2.0)
                 except Exception:
                     pass
-                self.inv_tree.insert("", "end", iid=str(item_id), values=(brand, model, sku, onhand))
-        self.inv_summary.config(text=f"Units (יחידות): {total_units} | Estimated store cost (עלות משוערת): ₪{total_cost:,.2f}")
+                brand_onhand[brand] = brand_onhand.get(brand, 0) + onhand
+
+        for brand, total in brand_onhand.items():
+            iid = self._inv_brand_iid(brand)
+            # Apply saved model/sku filter to compute displayed on-hand
+            sel = self._inv_sel().get(brand, {})
+            model_sel = sel.get("model", "")
+            sku_sel   = sel.get("sku",   "")
+            with connect() as c:
+                if model_sel and sku_sel:
+                    row = c.execute(
+                        "SELECT id FROM items WHERE brand=? AND model=? AND sku=?",
+                        (brand, model_sel, sku_sel)
+                    ).fetchone()
+                    display_onhand = inventory_on_hand(c, int(row[0])) if row else 0
+                elif model_sel:
+                    rs = c.execute(
+                        "SELECT id FROM items WHERE brand=? AND model=?",
+                        (brand, model_sel)
+                    ).fetchall()
+                    display_onhand = sum(inventory_on_hand(c, int(r[0])) for r in rs)
+                elif sku_sel:
+                    rs = c.execute(
+                        "SELECT id FROM items WHERE brand=? AND sku=?",
+                        (brand, sku_sel)
+                    ).fetchall()
+                    display_onhand = sum(inventory_on_hand(c, int(r[0])) for r in rs)
+                else:
+                    display_onhand = total
+
+            self.inv_tree.insert("", "end", iid=iid, values=(brand, "—", "—", display_onhand))
+
+        self.inv_summary.config(
+            text=f"Units (יחידות): {total_units} | Estimated store cost (עלות משוערת): ₪{total_cost:,.2f}"
+        )
         treeview_capture_default_order(self.inv_tree)
+
+        # Re-select and re-place combos for previously selected brand
+        if prev_brand and self.inv_tree.exists(self._inv_brand_iid(prev_brand)):
+            self.inv_tree.selection_set(self._inv_brand_iid(prev_brand))
+            self._inv_update_combos(prev_brand, preserve=True)
+            self.inv_tree.after_idle(lambda: self._inv_place_combos(prev_brand))
 
 if __name__ == "__main__":
     App().mainloop()
